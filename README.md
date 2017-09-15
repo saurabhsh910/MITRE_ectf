@@ -1,7 +1,7 @@
 # MITRE_ectf
 Secure Framework for updating firmware in an ECU of a self driving car remotely
 
-Challenge Overview
+# Challenge Overview
 You’re part of a team designing the next big evolution in
 automobiles – a self-driving car. Cars are complex systems
 and there are huge number of modules that have to work
@@ -34,7 +34,8 @@ your algorithms and other intellectual property.
 or act as a pivot-point to attack other devices that it connects to.
 - Hackers might try to use the update mechanism to install old versions of firmware that have known
 vulnerabilities.
-Your challenge is to design and implement a system to support secure firmware distribution for automotive control.
+
+# Your challenge is to design and implement a system to support secure firmware distribution for automotive control.
 Your system must meet a set of requirements (specified below) and defend against as many attacks as you and the other
 teams can think of. You must design and implement a working bootloader as well as a set of supporting tools for things
 such as: generating keys, provisioning bootloaders with those keys, protecting firmware updates, and installing those
