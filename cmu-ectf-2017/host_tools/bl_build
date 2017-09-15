@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+
+"""
+
+Copyright 2017 The MITRE Corporation
+
+Modifications: Copyright 2017 Mark Horvath, Surbhi Shah, Tiemoko Ballo, Saurabh Sharma, Pouria Pezeshkian, Karthic Palaniappan
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+ 
+http://www.apache.org/licenses/LICENSE-2.0
+ 
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+or implied. See the License for the specific language governing
+permissions and limitations under the License.
+
+
+"""
+
+"""
+Bootloader Build Tool
+
+This tool is responsible for building the bootloader from source and copying
+the build outputs into the host tools directory for programming.
+"""
+import os
+import time
+import random
+import shutil
+import subprocess
+import sys
+import Crypto
+
+from intelhex import IntelHex
+from Crypto.Cipher import AES
+
+KEY_SIZE = 32 #bytes
+FILE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+def make_bootloader(password=None):
+    """
+    Build the bootloader from source.
+
+    Return:
+        True if successful, False otherwise.
+    """
+    # Change into directory containing bootloader.
+    os.chdir('../bootloader')
+
+    subprocess.call('make clean', shell=True)
+    # Call make in subprocess to build bootloader.
+    if password is not None:
+        status = subprocess.call('make PASSWORD="%s"' % password, shell=True)
+    else:
+        status = subprocess.call('make')
+
+    # Return True if make returned 0, otherwise return False.
+    return (status == 0)
+
+def copy_artifacts(key):
+    """
+    Copy bootloader build artifacts into the host tools directory.
+    """
+    # Get directory containing this file (host_tools).
+    dst_dir = FILE_DIR
+
+    # Get directory containing bootloader output (bootloader).
+    src_dir = os.path.join(os.path.dirname(dst_dir), 'bootloader')
+
+    # Copy build artifacts from bootloader directory.
+    shutil.copy(os.path.join(src_dir, 'flash.hex'), dst_dir)
+    shutil.copy(os.path.join(src_dir, 'eeprom.hex'), dst_dir)
+
+def byte_to_hex( byteStr ):
+    """
+    Convert a hex string of 32 bytes to a comma seperated value format.
+    """
+    return ', '.join( [ "0x%02X" % ord( x ) for x in byteStr ] ).strip()
+
+def generate_readback_password():
+    """
+    Generate secret password for readback tool and store to secret file.
+    """
+    # Generate 16 character random password.
+    #pw = ''.join(chr(random.randint(0, 255)) for i in range(8)).encode('hex')
+
+    #generate secret random key
+    key = os.urandom(KEY_SIZE)
+    key_hex = byte_to_hex(key)
+
+    #generate a seed
+    seed = os.urandom(KEY_SIZE)
+    seed_hex = byte_to_hex(seed)
+    # Write key to secret_build_output.txt file.
+    with open('secret_build_output.txt', 'wb+') as secret_build_output:
+        secret_build_output.write(key.encode('hex'))
+
+    # Write key to key.txt file.
+    with open('../bootloader/secrets/key.txt', 'wb+') as secret_key_output:
+        secret_key_output.write(key_hex)
+
+    # Write seed to randomseed.txt file.
+    with open('../bootloader/secrets/randomseed.txt', 'wb+') as secret_seed:
+        secret_seed.write(seed_hex)
+
+    print("Sleeping to avoid clockskew...")
+    time.sleep(3)
+    
+def write_fuse_file(fuse_name, fuse_value):
+    hex_file = IntelHex()
+    hex_file[0] = fuse_value
+
+    with open(os.path.join(FILE_DIR, fuse_name + '.hex'), 'wb+') as outfile:
+        hex_file.tofile(outfile, format='hex')
+
+if __name__ == '__main__':
+    password = generate_readback_password()
+    if not make_bootloader(password=password):
+        print ("ERROR: Failed to compile bootloader.")
+        sys.exit(1)
+    copy_artifacts(password)
+    os.remove('../bootloader/secrets/randomseed.txt')
+    os.remove('../bootloader/secrets/key.txt')
+
+    # See http://eleccelerator.com/fusecalc/fusecalc.php?chip=atmega1284p&LOW=CE&HIGH=D8&EXTENDED=FC&LOCKBIT=FC
+    write_fuse_file('lfuse', 0xCE)
+    write_fuse_file('hfuse', 0xD8)
+    write_fuse_file('efuse', 0xFC)
+    write_fuse_file('lock', 0xFC)

@@ -1,0 +1,308 @@
+#!/usr/bin/env python
+
+"""
+Copyright 2017 The MITRE Corporation
+
+Modifications: Copyright 2017 Mark Horvath, Surbhi Shah, Tiemoko Ballo, Saurabh Sharma, Pouria Pezeshkian, Karthic Palaniappan
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+ 
+http://www.apache.org/licenses/LICENSE-2.0
+ 
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+or implied. See the License for the specific language governing
+permissions and limitations under the License.
+
+"""
+"""
+Memory Readback Tool
+
+A frame consists of four sections:
+1. One byte for the length of the password.
+2. The variable-length password.
+3. Four bytes for the start address.
+4. Four bytes for the number of bytes to read.
+
+  [ 0x01 ]  [ variable ]  [ 0x04 ]    [ 0x04 ]
+-------------------------------------------------
+| PW Length | Password | Start Addr | Num Bytes |
+-------------------------------------------------
+"""
+
+import serial
+import os
+import struct
+import sys
+import argparse
+import time
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA
+from Crypto.Hash import HMAC 
+
+RESP_OK = b'\xA5'
+DEBUG = 0
+HMAC_LEN = 20 # in bytes for SHA1
+HASH_LEN = HMAC_LEN
+NONCE_LENGTH = 16
+PAGE_SIZE = 256
+ADDR_BYTES = 4 
+BLOCKSIZE = AES.block_size
+
+DATA_BLOCK_SIZE = ADDR_BYTES + PAGE_SIZE + HMAC_LEN + 8 # 8 to pad it to a multiple of 16 bytes 
+pad = lambda s: s + (BLOCKSIZE - len(s) % BLOCKSIZE) * chr(BLOCKSIZE - len(s) % BLOCKSIZE)
+unpad = lambda s : s[0:-ord(s[-1])]
+
+###########################################################################################
+def hex_to_byte( hexStr ):
+    """
+    Convert a string hex byte values into a byte string. The Hex Byte values may
+    or may not be space separated.
+    """
+    # The list comprehension implementation is fractionally slower in this case    
+    #u
+    #    hexStr = ''.join( hexStr.split(" ") )
+    #    return ''.join( ["%c" % chr( int ( hexStr[i:i+2],16 ) ) \
+    #                                   for i in range(0, len( hexStr ), 2) ] )
+ 
+    bytes = []
+
+    hexStr = ''.join( hexStr.split(" ") )
+
+    for i in range(0, len(hexStr), 2):
+        bytes.append( chr( int (hexStr[i:i+2], 16 ) ) )
+
+    return ''.join( bytes )
+
+
+
+###########################################################################################
+def calc_hash(data):
+    h = SHA.new()
+    h.update(data)
+    return h.digest()
+###########################################################################################
+'''
+key : byte string 
+data : byte string, data to be encrypted
+'''
+def sign(key, data):
+    h = HMAC.new(key, digestmod=SHA)
+    h.update(data)
+    return h.digest()
+###########################################################################################
+def verify(key, data, signature):
+
+    if len(signature) != HMAC_LEN:
+        return False
+
+    new_hash = HMAC.new(key, digestmod=SHA)
+    new_hash.update(data)
+    new_digest = new_hash.digest()
+
+    i = 0
+    success = True 
+    while i < HMAC_LEN:
+        if new_digest[i] != signature[i]:
+            success = False
+        i+=1 
+
+    return success
+###########################################################################################
+def decrypt_ECB(key, data):
+    aes_obj = AES.new(key, AES.MODE_ECB) 
+    return aes_obj.decrypt(data)
+###########################################################################################
+'''
+key : byte string 
+data : byte string, data to be encrypted
+'''
+def encrypt_CBC(key, data):
+    # key must be 16 bytes or 24 bytes or 32 bytes long. Depending on length, AES will work
+    data = pad(data)
+    iv = os.urandom(BLOCKSIZE) # Generate a random IV every time. Important!
+    aes_obj = AES.new(key, AES.MODE_CBC, iv) # CBC mode requires a random IV every time 
+    enc = aes_obj.encrypt(data)
+    return iv + enc
+
+###########################################################################################
+def decrypt_CBC(key, data):
+    # key must be 16 bytes or 24 bytes or 32 bytes long. Depending on length, AES will work
+    iv = data[:BLOCKSIZE]
+    if DEBUG == 1 : print("IV =", byte_to_hex(iv))
+    if DEBUG == 1 : print("Encrypted Data = ", byte_to_hex(data))
+    aes_obj = AES.new(key, AES.MODE_CBC, iv) # CBC mode requires a random IV every time 
+    decrypted = aes_obj.decrypt(data[BLOCKSIZE:])
+    if DEBUG == 1 : print("Decrypted = ", byte_to_hex(decrypted))
+    if DEBUG == 1 : print("Unpadded = ", byte_to_hex(unpad(decrypted)))
+    return unpad(decrypted)
+
+###########################################################################################
+def byte_to_hex( byteStr ):
+    """
+    Convert a byte string to it's hex string representation e.g. for output.
+    """
+    
+    # Uses list comprehension which is a fractionally faster implementation than
+    # the alternative, more readable, implementation below
+    #   
+    #    hex = []
+    #    for aChar in byteStr:
+    #        hex.append( "%02X " % ord( aChar ) )
+    #
+    #    return ''.join( hex ).strip()        
+
+    return ''.join( [ "%02x" % ord( x ) for x in byteStr ] ).strip()
+###########################################################################################
+
+def construct_request(nonce, start_addr, num_bytes, key):
+    # Sign and Encrypt {Nonce, IVf, Start_addr, num_bytes} 
+    IV = os.urandom(AES.block_size)
+    request = nonce + IV + struct.pack('>II', start_addr, num_bytes)
+    signature = sign(key, request)
+    signed_request = request + signature 
+    return (encrypt_CBC(key, signed_request), IV)
+###########################################################################################
+
+def verify_data_block(data_block, key, iv):
+    dec_data_block = decrypt_CBC(key, iv + data_block)
+    length = len(dec_data_block)
+    if DEBUG == 1 : print("signature = ", byte_to_hex(dec_data_block[-HMAC_LEN:]))
+    is_valid_sign = verify(key, dec_data_block[0:length-HMAC_LEN], dec_data_block[-HMAC_LEN:])
+    return is_valid_sign, dec_data_block[0:length-HMAC_LEN]
+
+###########################################################################################
+def minimum(a,b):
+    if a<=b:
+        return a
+    else:
+        return b
+###########################################################################################
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Memory Readback Tool')
+
+    parser.add_argument("--port", help="Serial port to send update over.",
+                        required=True)
+    parser.add_argument("--address", help="First address to read from.",
+                        required=True)
+    parser.add_argument("--num-bytes", help="Number of bytes to read.",
+                        required=True)
+    parser.add_argument("--datafile", help="File to write data to (optional).")
+    args = parser.parse_args()
+
+    start_addr = int(args.address)
+    num_bytes = int(args.num_bytes)
+    end_addr = start_addr + num_bytes - 1
+   
+    if DEBUG == 1 : 
+        print("Start addr = ", start_addr)
+        print("num_bytes = ", num_bytes)
+        print("End addr = ", end_addr)
+
+    # Open serial port. Set baudrate. Set timeout to 4 seconds.
+    ser = serial.Serial(args.port, baudrate=115200, timeout=4)
+
+    # Wait for bootloader to reset/enter readback mode.
+    while ser.read(1) != 'R':
+        pass
+
+    # Send 'S' indicating readiness to accept nonce
+    ser.write('S')
+
+    # Waiting for encrypted nonce, This nonce is encrypted in ECB Mode (16 bytes)
+    enc_nonce = ser.read(NONCE_LENGTH)
+    
+    with open("secret_configure_output.txt", 'rb') as fw_file:
+        keyData = fw_file.read()
+
+    key = hex_to_byte(keyData)
+
+    # Decrypt the nonce 
+    nonce = decrypt_ECB(key, enc_nonce)
+    if DEBUG == 1 : print("Decrypted Nonce = ", byte_to_hex(nonce))
+
+    # Sign and Encrypt {Nonce, IVf, Start_addr, num_bytes} 
+    request, IV_for_device = construct_request(nonce ,start_addr, num_bytes, key)
+    
+    previous_IV = IV_for_device
+
+    # Send request     
+    ser.write(request)
+    ser.reset_output_buffer()
+    if DEBUG == 1 : print("Request Sent")
+
+    if args.datafile:
+        datafile = open(args.datafile, 'wb+') 
+
+    actual_start_addr = start_addr
+
+    while(actual_start_addr <= end_addr):
+        
+        page_start_addr = actual_start_addr & (-1 << 8) # Mask last 8 bits to make page_start_addr a multiple of PAGE_SIZE
+        actual_end_addr = minimum(end_addr, page_start_addr + PAGE_SIZE - 1)
+        actual_page_size = actual_end_addr - page_start_addr + 1 # Page size may be smaller for the last page 
+
+        if DEBUG == 1 : 
+            print("Expecting page with start address = ", page_start_addr)
+            print("Page size is always 288, but relevant data size = ", actual_page_size)
+            print("Relevant data end address = ", actual_end_addr)
+
+        # Read data block of 288 bytes 
+        data_block = ser.read(DATA_BLOCK_SIZE)
+        if len(data_block) != DATA_BLOCK_SIZE:
+            print("Error : Invalid length", len(data_block))
+            break
+        
+        if DEBUG == 1 : print("Encrypted = ", byte_to_hex(data_block))
+        
+        # Decrypt data block and check signature 
+        hash_previousIV = calc_hash(previous_IV)
+        IV_for_data_block = hash_previousIV[0:BLOCKSIZE] # Get first BLOCKSIZE bytes of hash to make it next IV 
+        if DEBUG == 1 : print("IV for data block :", IV_for_data_block)
+        is_valid, page = verify_data_block(data_block, key, IV_for_data_block) 
+
+        if is_valid is False:
+            print("Error : Data block verification failed")
+            break 
+
+        previous_IV = IV_for_data_block
+
+        # Beginning of data block contains 4 bytes of address
+        address = page[0:4]
+        if DEBUG == 1 : print("Start address of page= ", address)
+        page = page[4:] # Truncate address from the page 
+
+        addr = struct.unpack('<I', address) # Expecting address in little endian order 
+        if addr[0] == page_start_addr: # Expected page received 
+            skip_bytes = actual_start_addr - page_start_addr
+            page = page[skip_bytes: skip_bytes + actual_page_size]
+            sys.stdout.write(page.encode('hex')) # Read the data and write it to stdout (hex encoded).        
+            sys.stdout.flush()
+            if args.datafile:
+                datafile.write(page) # Write page to file 
+            
+            time.sleep(0.3)
+            if DEBUG == 1 : print("Sending T to device...")
+            ser.write('T')
+            actual_start_addr = page_start_addr + PAGE_SIZE
+        
+        else:
+            if DEBUG == 1 : print("Invalid address received, Expected = ", byte_to_hex(page_start_addr), "Received = ", addr)   
+        
+
+    if args.datafile:
+        datafile.close()
+
+    
+               
+            
+
+    
+    
+
+    
+
+    
