@@ -1,5 +1,5 @@
 # MITRE_ectf
-Secure Framework for updating firmware in an ECU of a self driving car remotely
+Secure Framework for updating firmware of an ECU in a self driving car
 
 # Challenge Overview
 You’re part of a team designing the next big evolution in
